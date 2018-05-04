@@ -1,19 +1,17 @@
-## amiimporter -- A tool to help import vagrant box files as AWS ec2 images.
+## create_centos_ami_aws_china -- A tool to help import CentOS 7 Cloud vagrant box files as AWS ec2 images in AWS China
 
+Based on: https://github.com/dliappis/amiimporter
 With this tool you can convert your vagrant box file to an AWS AMI (i.e. an ec2 image).
+Pulls CentOS Vagrant images from: http://cloud.centos.org/centos/${CentOS-version}/vagrant/x86_64/images/
 
-Using an S3 bucket of your choice it will import the box and produce AMIs in three regions, `eu-central-1`, `us-west-2` and `us-east-1`. The target regions can be easily adjusted.
+Using an S3 bucket of your choice (or it will automatically create one) it will import the box and produce AMIs in 'cn-north-1', 'cn-northwest-1'
 
 
 ### Prerequisites and limitations
 
-- A vagrant box using virtualbox.
-
-- Your vagrant box has [cloud-init](https://cloudinit.readthedocs.org/en/latest/) installed and configured. `ec2-user` is a good candidate for the user where the boot key will be installed.
-
 - The produced AMIs are suitable for [HVM virtualization](http://docs.aws.amazon.com/AWSEC2/latest/UserGuide/virtualization_types.html). pv requires more steps such as installing a pv enabled kernel.
 
-- Define an s3 bucket (in a region close to you, to speed up uploads.)
+- Creates a temporary S3 bucket in cn-north-1 
   This will be used to upload the images for conversion to AMI.
 
 - Define roles and policies in AWS. In particular:
@@ -43,13 +41,16 @@ Using an S3 bucket of your choice it will import the box and produce AMIs in thr
 
 ### The required parameters are:
 
-- `--vboxfile`
-  Path to the vagrant .box file you wish to convert to AMI. Currently only virtualbox providers are supported.
+- `--centos-version`
+  Version of CentOS that you want to use
+
+- `--revision`
+  Revision number you want to use, example "1803_01"
 
 - `--s3bucket`
   `[--s3key]`
 
-  The s3bucket and the (temporary) key used for uploading the VM.
+  The s3bucket and the (temporary) key used for uploading the VM.  If not specified, IAM permissions to create an S3 bucket are required.
   `s3key` is optional but if you omit it, `vboxfile` expect a certain naming convention like `osdistroVER-othermetadata.box`
   For example ./oel7.1-x86_64-virtualbox.box is a valid name.
 
@@ -61,7 +62,7 @@ By default it will created copies of the temporary AMI that AWS import-image cre
 It easy to add or remove destination regions in [this list](https://github.com/dliappis/amiimporter/blob/master/amiimporter.py#L173)
 
 #### Example
-For an existing oracle linux vagrant box:
+
 
 ``` shell
 $ ./amiimporter.py --s3bucket mybucket --vboxfile ./oel7.1-x86_64-virtualbox.box --verbose
