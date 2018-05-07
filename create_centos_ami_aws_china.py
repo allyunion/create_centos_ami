@@ -4,22 +4,27 @@
 
 # pylint ignores
 # pylint: disable=fixme
+# pylint: disable=too-many-arguments
+# pylint: disable=too-many-branches
 
 # Python standard libraries
 import argparse
+import datetime
 from hashlib import sha256
-import json
+#import json
 import logging
 import os
 import re
+from urllib.request import HTTPError
 import subprocess
 import sys
-import time
+#import time
 
 # Custom Libraries
 
 # boto libraries
-#import boto3
+from botocore.client import ClientError, Config
+import boto3
 #from boto3.s3.key import Key
 #from boto3 import ec2
 
@@ -28,20 +33,354 @@ from pySmartDL import SmartDL
 
 SHA256SUM = ('http://cloud.centos.org/centos/{centos_version}/vagrant/'
              'x86_64/images/sha256sum.txt')
-__BASE_URL = ('http://cloud.centos.org/centos/{centos_version}/vagrant/'
+BASE_URL = ('http://cloud.centos.org/centos/{centos_version}/vagrant/'
               'x86_64/images/CentOS-{centos_version}-x86_64-Vagrant-{revision}'
               '.VirtualBox.box')
-__BASE_FILENAME = ('CentOS-{centos_version}-x86_64-Vagrant-{revision}'
+BASE_FILENAME = ('CentOS-{centos_version}-x86_64-Vagrant-{revision}'
                    '.VirtualBox.box')
+
+def calculate_sha256_sum(filename):
+    with open(filename, 'rb') as fopen:
+        return sha256(fopen.read()).hexdigest()
+
+class CentOSVagrantBox(object):
+    """A CentOS Vagrant Box object"""
+    def __init__(self, centos_version, revision, tmpdir='./tmpdir'):
+        """Constructor"""
+        self.data = {
+            'CentOS Version': centos_version,
+            'Revision': revision}
+        self.filename = BASE_FILENAME.format(
+            centos_version=centos_version,
+            revision=revision)
+        self.url = BASE_URL.format(
+            centos_version=centos_version,
+            revision=revision)
+        self.tmpdir = tmpdir
+        self.sha256sum = self.__get_sha256sum__()
+        self.vmdkfile = None
+
+    def __get_sha256sum__(self):
+        """Returns the sha256sum file you want to download"""
+        sha256sum_url = SHA256SUM.format(
+            centos_version=self.data['CentOS Version'])
+        shadl = SmartDL(sha256sum_url, self.tmpdir)
+        try:
+            shadl.start()
+        except HTTPError as error:
+            raise ValueError(
+                str("Invalid CentOS Version: {}!".format(
+                    self.data['CentOS Version']))) from error
+
+        sha256sum_filename = os.path.join(self.tmpdir, 'sha256sum.txt')
+
+        with open(sha256sum_filename) as fopen:
+            for line in fopen.readlines():
+                if self.filename in line:
+                    return line.split(' ')[0]
+
+        raise FileNotFoundError(self.filename + \
+            " not found in sha256sum.txt file")
+
+    def download(self):
+        """Download the CentOS vagrant box file from cloud.centos.org"""
+
+        downloader = SmartDL(
+            self.url,
+            self.tmpdir)
+
+        downloader.add_hash_verification(
+            'sha256',
+            self.sha256sum)
+
+        try:
+            downloader.start()
+        except HTTPError as error:
+            raise ValueError(
+                str(
+                    "Invalid specified revision: {}".format(
+                        self.data['Revision']))) from error
+
+    def verify_local_copy(self):
+        """Verify the local copy against known SHA256 hash"""
+
+        fullpath = os.path.join(self.tmpdir, self.filename)
+        return calculate_sha256_sum(fullpath) == self.sha256sum
+
+    def convert_to_vmdk(self):
+        """Extract box file and convert to OVA, as required for AWS Import"""
+
+        fullpath = os.path.join(self.tmpdir, self.filename)
+
+        try:
+            # split basename/dirname;
+            # use regexp as basename may contain dot for version
+            parsed_vbox_filename = re.search(r'(.+)\.([A-Za-z]+)', fullpath)
+            vboxprefix, vboxsuffix = parsed_vbox_filename.group(1), parsed_vbox_filename.group(2)
+            subprocess.check_call(
+                ["gunzip",
+                 "-S",
+                 "."+vboxsuffix,
+                 os.path.basename(fullpath)
+                ], cwd=self.tmpdir)
+            subprocess.check_call(
+                ["tar",
+                 "xf",
+                 os.path.basename(vboxprefix)
+                ], cwd=self.tmpdir)
+
+            self.vmdkfile = [
+                file for file in os.listdir(
+                    self.tmpdir) if '.vmdk' in file][0]
+
+        except subprocess.CalledProcessError as error:
+            raise Exception(
+                str(
+                    "Error while extracting supplied vbox file: {}".format(
+                        self.filename))) from error
+        except IndexError as error:
+            raise Exception(
+                str("Found more than one .vmdk files after extracting "
+                    "{}").format(self.filename)) from error
+
+    def get_tmpdir(self):
+        """Returns the temp directory"""
+        return self.tmpdir
+
+    def get_vmdkfile(self):
+        """Return vmdk filename"""
+        return self.vmdkfile
+
+class AWSConvertVMDK2AMI(object):
+    """A class that handles the conversion of a VMDK file to AMI"""
+
+    def __init__(
+            self,
+            filename,
+            source_region,
+            destination_regions=None,
+            verification=False,
+            aws_access_key=None,
+            aws_secret_key=None,
+            aws_profile=None):
+        """Constructor"""
+        if not os.path.exists(filename):
+            raise FileNotFoundError(str(
+                "Unable to locate vagrant box file: '{}'").format(
+                    filename))
+        self.fullpath = filename
+        self.filename = os.path.basename(filename)
+        self.source_region = source_region
+        self.destination_regions = destination_regions
+        self.verification = verification
+        self.aws_credentials = {
+            'AWS Access Key': aws_access_key,
+            'AWS Secret Key': aws_secret_key,
+            'AWS Profile': aws_profile,
+            'Session': None}
+        self.temporary = True
+        if aws_profile is not None:
+            if aws_access_key is None and aws_secret_key is None:
+                self.aws_credentials['Session'] = boto3.Session(
+                    profile_name=aws_profile,
+                    region_name=source_region)
+            else:
+                raise ValueError(
+                    'Cannot specify aws_profile & aws_access_key'
+                    '/aws_secret_key')
+        else:
+            if aws_access_key is None and aws_secret_key is None:
+                # If not specified, assume default
+                self.aws_credentials['Session'] = boto3.Session(
+                    profile_name='default',
+                    region_name=source_region)
+            else:
+                self.aws_credentials['Session'] = boto3.Session(
+                    aws_access_key_id=aws_access_key,
+                    aws_secret_access_key=aws_secret_key,
+                    region_name=source_region)
+
+        if not isinstance(destination_regions, list):
+            if destination_regions is None:
+                destination_regions = [source_region]
+            else:
+                raise ValueError(
+                    "Expected list or NoneType for destination_regions!")
+
+        if re.match('^cn-', source_region):
+            if not self.verification:
+                raise ValueError(
+                    'SHA256 verification must be True for AWS China!')
+
+            # Make sure that only China region handle only in
+            # an AWS China account
+            for region in destination_regions:
+                if not re.match('^cn-', region):
+                    raise ValueError(str(
+                        '{} is not located in China!'.format(region)))
+        else:
+            # Make sure no China region is in the list
+            for region in destination_regions:
+                if re.match('^cn-', region):
+                    raise ValueError(str(
+                        'Cannot handle an AWS China region with given '
+                        'source_region of {}').format(source_region))
+
+    def check_s3_bucket(self, bucketname=None, s3_access_key=None, s3_secret_key=None):
+        """Check if the S3 bucket exists"""
+        session = self.aws_credentials['Session']
+        if s3_access_key and s3_secret_key:
+            session = boto3.Session(
+                aws_access_key_id=s3_access_key,
+                aws_secret_access_key=s3_secret_key,
+                region_name=self.source_region)
+        client = session.client(
+            's3',
+            config=Config(signature_version='s3v4'))
+        resource = session.resource('s3')
+        bucket = None
+
+        if bucketname is not None:
+            try:
+                response = client.head_bucket(Bucket=bucketname)
+                self.temporary = False
+            except ClientError:
+                bucketname = None
+
+        if bucketname is None:
+            bucketname = 'CentOS.AMI.{}.{}'.format(
+                self.filename,
+                datetime.datetime.utcnow().strftime('%Y%m%d.%H%M%S'))
+            if self.source_region != 'us-east-1':
+                bucket = resource.create_bucket(
+                    Bucket=bucketname,
+                    ACL='private',
+                    CreateBucketConfiguration={
+                        'LocationConstraint': self.source_region})
+            else:
+                bucket = resource.create_bucket(
+                    Bucket=bucketname,
+                    ACL='private')
+
+            # Enable encryption
+            client.put_bucket_encryption(
+                Bucket=bucket.name,
+                ServerSideEncryptionConfiguration={
+                    'Rules': [
+                        {
+                            'ApplyServerSideEncryptionByDefault': {
+                                'SEEAlgorithm': 'AES256'
+                            }
+                        }
+                    ]
+                }
+            )
+        else:
+            bucket = resource.Bucket(name=bucketname)
+
+        return bucket
+
+    def upload_to_s3(self, bucketname=None, s3_access_key=None, s3_secret_key=None):
+        """Upload the VMDK file to S3 using s3_access_key & s3_secret_key
+        credentials (if given) otherwise, default to aws_profile or
+        aws_access_key/aws_secret key combination given when initialized"""
+        session = self.aws_credentials['Session']
+        if s3_access_key and s3_secret_key:
+            session = boto3.Session(
+                aws_access_key_id=s3_access_key,
+                aws_secret_access_key=s3_secret_key,
+                region_name=self.source_region)
+        client = session.client(
+            's3',
+            config=Config(signature_version='s3v4'))
+        resource = session.resource('s3')
+        bucket = self.check_s3_bucket(
+            bucketname=bucketname,
+            s3_access_key=s3_access_key,
+            s3_secret_key=s3_secret_key)
+
+        if self.verification:
+            sha256sum = calculate_sha256_sum(self.filename)
+
+            extra_args = {'Metadata':
+                {'x-amz-content-sha256': sha256sum}
+            }
+
+            # Upload the file
+            client.upload_file(
+                self.fullpath,
+                bucket.name,
+                self.filename,
+                extra_args)
+
+            # Re-download the file to verify
+            s3_object = s3.Object(
+                bucket.name,
+                self.filename)
+            s3_object.download_file(self.fullpath + '.verify')
+            test_sha256 = calculate_sha256_sum(self.fullpath + '.verify')
+            os.remove(self.fullpath + '.verify')
+            if sha256sum != test_sha256:
+                raise IOError(str(
+                    'Calculated S3 SHA256 sum does '
+                    'not match local copy:\n'
+                    'local: "{}" != remote: "{}"').format(
+                        sha256sum, test_sha256))
+        else:
+            client.upload_file(
+                self.fullpath,
+                bucket.name,
+                self.filename,
+                extra_args)
+
+        return bucket.name
+
+    def export_ami(self, description, bucketname=None, alt_access_key=None, alt_secret_key=None):
+        session = self.aws_credentials['Session']
+        if alt_access_key and alt_secret_key:
+            session = boto3.Session(
+                aws_access_key_id=alt_access_key,
+                aws_secret_access_key=alt_secret_key,
+                region_name=self.source_region)
+
+        if bucketname is None:
+           bucketname = self.upload_to_s3(bucketname, alt_access_key, alt_secret_key)
+
+#        version, revision = re.findall(
+#            'CentOS-(\d+)-x86_64-Vagrant-(\d+_\d+)\.VirtualBox',
+#            self.filename)[0]
+#        description = 'CentOS Linux {} x86_64 HVM EBS {}'.format(
+#                version, revision)
+
+        ec2 = session.client('ec2', region_name=self.source_region)
+        response = ec2.import_image(
+            Architecture='x86_64',
+            Description=description,
+            DiskContainers=[
+                {
+                    'Description': description,
+                    'DeviceName': '/dev/sda1',
+                    'Format': 'VMDK',
+                    'Url': 's3://{}/{}'.format(
+                        bucketname, self.filename)
+                }
+            ],
+            Hypervisor='xen',
+            LicenseType='AWS',
+            Platform='Linux'
+        )
+
+        amis_created = {}
+        for region in self.destination_regions:
+            ec2 = session.client('ec2', region_name=region)
+#            amis_created[region] = ec2.copy_image(self.source_region,
+
 
 def make_opt_parser():
     """Parse the options from command line"""
     parser = argparse.ArgumentParser(description='Import virtualbox vagrant box as AWS AMI')
     parser.add_argument('--region', default='cn-north-1')
     parser.add_argument('--s3bucket', help='s3bucket', default=None)
-    parser.add_argument('--s3key',
-                        help='s3key e.g. centos-6-hvm-20160125111111'
-                        'if ommited your vboxfile must look like e.g. centos6.7-20160101111111')
     parser.add_argument('--version',
                         required=False,
                         help='The CentOS version that you want to use',
@@ -64,41 +403,6 @@ def make_opt_parser():
                         action='store_true')
     return parser
 
-def download_vagrant_file(parser):
-    """Download the Vagrant CentOS vagrant file from CentOS"""
-
-    sha256sum_url = SHA256SUM.format(centos_version=parser.version)
-    shadl = SmartDL(sha256sum_url, parser.tempdir)
-    shadl.start()
-
-    sha256sum_filename = os.path.join(parser.tempdir, 'sha256sum.txt')
-
-    vagrant_filename = __BASE_FILENAME.format(centos_version=parser.version,
-                                              revision=parser.revision)
-
-    sha256_crc = None
-    with open(sha256sum_filename) as fopen:
-        for line in fopen.readlines():
-            if vagrant_filename in line:
-                sha256_crc = line.split(' ')[0]
-
-    #sys.exit(0)
-
-    url = __BASE_URL.format(centos_version=parser.version,
-                            revision=parser.revision)
-    downloader = SmartDL(url, parser.tempdir)
-    downloader.start()
-
-    fullpath = os.path.join(
-        parser.tempdir,
-        vagrant_filename)
-
-    with open(fullpath, 'rb') as fread:
-        check_sha256 = sha256(fread.read()).hexdigest()
-        print(check_sha256 == sha256_crc)
-
-    sys.exit(0)
-
 def cleanup_temp_dir(parser):
     """Clean up the temporary directory"""
     if not os.path.isdir(parser.tempdir):
@@ -107,206 +411,19 @@ def cleanup_temp_dir(parser):
     for tfile in os.listdir(parser.tempdir):
         os.remove("{}/{}".format(parser.tempdir, tfile))
 
-
-def vbox_to_vmdk(parser):
-    """
-    Extract vbox and convert to OVA, required for AWS import
-    """
-    vmdkfile = None
-    fullpath = os.path.join(parser.tempdir,
-                            __BASE_FILENAME.format(
-                                centos_version=parser.version,
-                                revision=parser.revision))
-    try:
-        # split basename/dirname; use regexp as basename may contain dot for version
-        parsed_vbox_filename = re.search(r'(.+)\.([A-Za-z]+)', fullpath)
-        vboxprefix, vboxsuffix = parsed_vbox_filename.group(1), parsed_vbox_filename.group(2)
-        subprocess.check_call(
-            ["gunzip",
-             "-S",
-             "."+vboxsuffix,
-             os.path.basename(fullpath)
-            ], cwd=parser.tempdir)
-        subprocess.check_call(
-            ["tar",
-             "xf",
-             os.path.basename(vboxprefix)
-            ], cwd=parser.tempdir)
-
-        vmdkfile = [
-            file for file in os.listdir(parser.tempdir) if '.vmdk' in file][0]
-
-    except subprocess.CalledProcessError as error:
-        print("Error while extracting supplied vbox file: {}".format(parser.vboxfile))
-        print("Reported error is: {}".format(error))
-        sys.exit(1)
-    except IndexError:
-        print("Found more than one .vmdk files after extracting {}".format(parser.vboxfile))
-        sys.exit(1)
-
-    return "{}/{}".format(parser.tempdir, vmdkfile)
-
-
-def upload_vmdk_to_s3(parser, vmdkfile):
-    """Upload the extracted vmdk file to S3"""
-    #def percent_cb(completed, total):
-    #    """Internal function for progress meter"""
-    #    if not parser.verbose:
-    #        return
-    #    sys.stdout.write("\r{}%".format(0 if completed == 0 else completed*100/total))
-    #    sys.stdout.flush()
-    logging.info(str("Uploading {} to s3".format(vmdkfile)))
-    # boto2 doesn't have import-image yet; use aws cli command until we switch to boto3
-    if not parser.s3key:
-        (osname, osver, creationdate) = parse_vbox_name(os.path.basename(parser.vboxfile))
-        s3file = "temp-hvm-{}-{}-{}".format(osname, osver, creationdate)
-        parser.s3key = s3file
-    else:
-        s3file = parser.s3key
-    #aws_access_key = os.environ.get('AWS_ACCESS_KEY_ID')
-    #aws_secret_key = os.environ.get('AWS_SECRET_ACCESS_KEY_ID')
-
-#    s3conn = boto3.connect_s3(aws_access_key,
-#                              aws_secret_key)
-
-    # see https://github.com/boto/boto/issues/2741
-#    bucket = s3conn.get_bucket(parser.s3bucket, validate=False)
-#    bucket_location = bucket.get_location()
-#    if bucket_location:
-#        conn = boto3.s3.connect_to_region(bucket_location)
-#        parser.region = bucket_location
-#        bucket = conn.get_bucket(parser.s3bucket)
-    # TODO check if key exists in bucket
-#    s3key = Key(bucket)
-#    s3key.key = s3file
-#    s3key.set_contents_from_filename(vmdkfile, cb=percent_cb, num_cb=10)
-
-
-def delete_s3key(parser):
-    """Delete the s3 key"""
-    #aws_access_key = os.environ.get('AWS_ACCESS_KEY_ID')
-    #aws_secret_key = os.environ.get('AWS_SECRET_ACCESS_KEY_ID')
-
-    #s3conn = boto3.connect_s3(aws_access_key,
-    #                          aws_secret_key)
-
-    # see https://github.com/boto/boto/issues/2741
-    #bucket = s3conn.get_bucket(parser.s3bucket, validate=False)
-    #bucket_location = bucket.get_location()
-    #if bucket_location:
-    #    conn = boto3.s3.connect_to_region(bucket_location)
-    #    parser.region = bucket_location
-    #    bucket = conn.get_bucket(parser.s3bucket)
-#    s3key = Key(bucket)
-#    s3key.key = parser.s3key
-    #logging.info(str("Deleting updateded s3 file s3://{}/{}".format(
-    #    parser.s3bucket,
-    #    parser.s3key)))
-#    bucket.delete_key(s3key)
-    print(parser)
-
-def import_s3key_to_ami(parser):
-    """Import s3 key to ami"""
-    try:
-        aws_disk_container = {'Description': parser.s3key,
-                              'DiskContainers': [{
-                                  'Description': parser.s3key,
-                                  'UserBucket': {
-                                      'S3Bucket': parser.s3bucket,
-                                      'S3Key': parser.s3key}
-                                  }]}
-        aws_import_command = [
-            'aws',
-            '--region', parser.region,
-            'ec2', 'import-image',
-            '--cli-input-json', json.dumps(aws_disk_container)]
-        logging.info(str(
-            "Running: {}".format(' '.join(aws_import_command))))
-        importcmd_resp = subprocess.check_output(aws_import_command)
-    except subprocess.CalledProcessError:
-        logging.error("An error occured while execuring"
-                      " ".join(aws_import_command))
-
-    logging.debug(json.loads(importcmd_resp))
-    import_task_id = json.loads(importcmd_resp)['ImportTaskId']
-    logging.info("AWS is now importing vdmk to AMI.")
-
-    while True:
-        aws_import_status_cmd = [
-            'aws',
-            '--region', parser.region,
-            'ec2', 'describe-import-image-tasks',
-            '--import-task-ids', import_task_id]
-        import_progress_resp = json.loads(
-            subprocess.check_output(
-                aws_import_status_cmd))['ImportImageTasks'][0]
-        if 'Progress' not in import_progress_resp.keys() \
-                and 'ImageId' in import_progress_resp.keys():
-            temporary_ami = import_progress_resp['ImageId']
-            logging.info(str(
-                "Done, ami-id is {}".format(temporary_ami)))
-            break
-        else:
-            import_progress = import_progress_resp['Progress']
-            sys.stdout.write("\r%s%%" % import_progress)
-            sys.stdout.flush()
-        time.sleep(5)
-    logging.info(str(
-        "Successfully created temporary AMI {}".format(temporary_ami)))
-
-    # import-image created random name and description. Those can't be modified.
-    # Create copies for all regions with the right metadata instead.
-#    amis_created = {}
-#    for region in ['cn-north-1', 'cn-northeast-1']:
-#        ec2conn = ec2.connect_to_region(region)
-#        amis_created[region] = ec2conn.copy_image(
-#            parser.region,
-#            temporary_ami,
-#            name=parser.s3key,
-#            description=parser.s3key)
-#        print("Created {} in region {}".format(
-#            amis_created[region].image_id,
-#            region))
-
-    logging.info(str(
-        "Deregistering temporary AMI {}".format(temporary_ami)))
-    #ec2conn = ec2.connect_to_region(parser.region)
-    #ec2conn.deregister_image(temporary_ami)
-
-
-def parse_vbox_name(vboxname):
-    """Parse the box name"""
-    vbox_tokens = vboxname.split('-')
-    osname = re.search('^[a-zA-Z]+', vbox_tokens[0]).group(0)
-    osver = re.search(r'[0-9\.]+', vbox_tokens[0]).group(0)
-
-    if osname == 'ubuntu':
-        osver = osver
-    elif osname == 'debian':
-        osver = osver.split('.')[0]
-    elif osname == 'opensuse' or osname == 'sles' or osname == 'oel':
-        osver = osver.split('.')[0]
-    else:
-        osver = osname
-
-    # isodate in UTC
-    creationdate = time.strftime("%Y%m%d%H%M%S", time.gmtime())
-
-    return (osname, osver, creationdate)
-
-
 def main(opts):
     """Main function"""
     if opts.verbose:
         logging.basicConfig(level=logging.INFO)
     cleanup_temp_dir(opts)
-    download_vagrant_file(opts)
+    box = CentOSVagrantBox(
+        centos_version=opts.version,
+        revision=opts.revision,
+        tmpdir=opts.tempdir)
+    box.download()
     sys.exit(0)
-    vmdkfile = vbox_to_vmdk(opts)
-    upload_vmdk_to_s3(opts, vmdkfile)
-    import_s3key_to_ami(opts)
-    delete_s3key(opts)
     cleanup_temp_dir(opts)
+
 
 if __name__ == '__main__':
     main(make_opt_parser().parse_args(sys.argv[1:]))
