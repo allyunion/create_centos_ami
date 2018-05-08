@@ -59,6 +59,8 @@ class CentOSVagrantBox(object):
             centos_version=centos_version,
             revision=revision)
         self.tmpdir = tmpdir
+        if not os.path.isdir(tmpdir):
+            os.mkdir(tmpdir)
         self.sha256sum = self.__get_sha256sum__()
         self.vmdkfile = None
 
@@ -147,6 +149,14 @@ class CentOSVagrantBox(object):
             self.data['CentOS Version'],
             self.data['Revision'],
             datetime.datetime.utcnow().strftime('%Y-%m-%d-%H%M%S'))
+
+    def cleanup(self, force=False):
+        """Clean up the temporary directory and files"""
+        if os.path.isdir(self.tmpdir):
+            for tfile in os.listdir(self.tmpdir):
+                os.remove(os.path.join(self.tmpdir, tfile))
+            if force:
+                os.remove(self.tmpdir)
 
 
 class AWSConvertVMDK2AMI(object):
@@ -437,19 +447,10 @@ def make_opt_parser():
                         action='store_true')
     return parser
 
-def cleanup_temp_dir(parser):
-    """Clean up the temporary directory"""
-    if not os.path.isdir(parser.tempdir):
-        os.mkdir(parser.tempdir)
-        return
-    for tfile in os.listdir(parser.tempdir):
-        os.remove("{}/{}".format(parser.tempdir, tfile))
-
 def main(opts):
     """Main function"""
     if opts.verbose:
         logging.basicConfig(level=logging.INFO)
-    cleanup_temp_dir(opts)
     box = CentOSVagrantBox(
         centos_version=opts.version,
         revision=opts.revision,
@@ -457,8 +458,6 @@ def main(opts):
     box.download()
     box.convert_to_vmdk()
     sys.exit(0)
-    cleanup_temp_dir(opts)
-
 
 if __name__ == '__main__':
     main(make_opt_parser().parse_args(sys.argv[1:]))
