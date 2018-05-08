@@ -157,6 +157,8 @@ class AWSConvertVMDK2AMI(object):
     def __init__(
             self,
             filename,
+            centos_version,
+            revision,
             source_region,
             destination_regions=None,
             verification=False,
@@ -177,7 +179,12 @@ class AWSConvertVMDK2AMI(object):
             'AWS Access Key': aws_access_key,
             'AWS Secret Key': aws_secret_key,
             'AWS Profile': aws_profile,
-            'Session': None}
+            'Session': None
+        }
+        self.data = {
+            'CentOS Version': centos_version,
+            'Revision': revision
+        }
         self.temporary = True
         if aws_profile is not None:
             if aws_access_key is None and aws_secret_key is None:
@@ -335,7 +342,7 @@ class AWSConvertVMDK2AMI(object):
 
         return bucket.name
 
-    def export_ami(self, description, bucketname=None, alt_access_key=None, alt_secret_key=None):
+    def export_ami(self, bucketname=None, alt_access_key=None, alt_secret_key=None):
         session = self.aws_credentials['Session']
         if alt_access_key and alt_secret_key:
             session = boto3.Session(
@@ -349,8 +356,10 @@ class AWSConvertVMDK2AMI(object):
 #        version, revision = re.findall(
 #            'CentOS-(\d+)-x86_64-Vagrant-(\d+_\d+)\.VirtualBox',
 #            self.filename)[0]
-#        description = 'CentOS Linux {} x86_64 HVM EBS {}'.format(
-#                version, revision)
+        description = 'CentOS Linux {} x86_64 HVM EBS {} {}'.format(
+                self.data['CentOS Version'],
+                self.data['Revision'],
+                datetime.datetime.utcnow().strftime('%Y-%m-%d-%H%M%S'))
 
         ec2 = session.client('ec2', region_name=self.source_region)
         response = ec2.import_image(
@@ -369,11 +378,21 @@ class AWSConvertVMDK2AMI(object):
             LicenseType='AWS',
             Platform='Linux'
         )
+        temporary_ami = response['ImageId']
 
         amis_created = {}
         for region in self.destination_regions:
             ec2 = session.client('ec2', region_name=region)
-#            amis_created[region] = ec2.copy_image(self.source_region,
+            amis_created[region] = ec2.copy_image(
+                Description=description,
+                Name=description,
+                SourceImageId=temporary_ami,
+                SourceRegion=self.source_region)
+
+        logging.info(str(
+            "Deregistering temporary AMI {}".format(temporary_ami))
+        ec2 = session.client('ec2', region_name=self.source_region)
+        ec2.deregister_image(ImageId=temporary_ami)
 
 
 def make_opt_parser():
