@@ -112,30 +112,12 @@ class CentOSVagrantBox(object):
     def convert_to_vmdk(self):
         """Extract box file and convert to OVA, as required for AWS Import"""
 
-        fullpath = os.path.join(self.tmpdir, self.filename)
-
         try:
-            # split basename/dirname;
-            # use regexp as basename may contain dot for version
-            #parsed_vbox_filename = re.search(r'(.+)\.([A-Za-z]+)', fullpath)
-            #vboxprefix, vboxsuffix = parsed_vbox_filename.group(1), parsed_vbox_filename.group(2)
-            # Raw CentOS boxes seem to be uncompressed, just tar'd
-            # subprocess.check_call(
-            #     ["gunzip",
-            #      "-S",
-            #      "."+vboxsuffix,
-            #      os.path.basename(fullpath)
-            #     ], cwd=self.tmpdir)
-            # subprocess.check_call(
-            #     ["tar",
-            #      "xf",
-            #      os.path.basename(vboxprefix)
-            #     ], cwd=self.tmpdir)
-            subprocess.check_call(
-                ["tar",
-                 "xf",
-                 self.filename
-                 ], cwd=self.tmpdir)
+            subprocess.check_call([
+                "tar",
+                "xf",
+                self.filename
+                ], cwd=self.tmpdir)
 
             self.vmdkfile = [
                 file for file in os.listdir(
@@ -162,10 +144,10 @@ class CentOSVagrantBox(object):
     def get_description_for_aws(self):
         """Return a CentOS description for AWS"""
         return 'CentOS Linux {} x86_64 HVM EBS {} {}'.format(
-                self.data['CentOS Version'],
-                self.data['Revision'],
-                datetime.datetime.utcnow().strftime('%Y-%m-%d-%H%M%S'))
-        
+            self.data['CentOS Version'],
+            self.data['Revision'],
+            datetime.datetime.utcnow().strftime('%Y-%m-%d-%H%M%S'))
+
 
 class AWSConvertVMDK2AMI(object):
     """A class that handles the conversion of a VMDK file to AMI"""
