@@ -6,6 +6,7 @@
 # pylint: disable=fixme
 # pylint: disable=too-many-arguments
 # pylint: disable=too-many-branches
+# pylint: disable=too-many-instance-attributes
 
 # Python standard libraries
 import argparse
@@ -34,12 +35,13 @@ from pySmartDL import SmartDL
 SHA256SUM = ('http://cloud.centos.org/centos/{centos_version}/vagrant/'
              'x86_64/images/sha256sum.txt')
 BASE_URL = ('http://cloud.centos.org/centos/{centos_version}/vagrant/'
-              'x86_64/images/CentOS-{centos_version}-x86_64-Vagrant-{revision}'
-              '.VirtualBox.box')
+            'x86_64/images/CentOS-{centos_version}-x86_64-Vagrant-{revision}'
+            '.VirtualBox.box')
 BASE_FILENAME = ('CentOS-{centos_version}-x86_64-Vagrant-{revision}'
-                   '.VirtualBox.box')
+                 '.VirtualBox.box')
 
 def calculate_sha256_sum(filename):
+    """Calculate the SHA256 sum of the given filename"""
     with open(filename, 'rb') as fopen:
         return sha256(fopen.read()).hexdigest()
 
@@ -157,10 +159,11 @@ class AWSConvertVMDK2AMI(object):
     def __init__(
             self,
             filename,
-            centos_version,
-            revision,
+            description,
             source_region,
             destination_regions=None,
+            bucket=None,
+            tags=None,
             verification=False,
             aws_access_key=None,
             aws_secret_key=None,
@@ -181,11 +184,10 @@ class AWSConvertVMDK2AMI(object):
             'AWS Profile': aws_profile,
             'Session': None
         }
-        self.data = {
-            'CentOS Version': centos_version,
-            'Revision': revision
-        }
-        self.temporary = True
+        self.description = description
+        self.bucketname = bucket
+        self.tags = tags
+        self.temporary = bucket is None
         if aws_profile is not None:
             if aws_access_key is None and aws_secret_key is None:
                 self.aws_credentials['Session'] = boto3.Session(
@@ -233,8 +235,9 @@ class AWSConvertVMDK2AMI(object):
                         'Cannot handle an AWS China region with given '
                         'source_region of {}').format(source_region))
 
-    def check_s3_bucket(self, bucketname=None, s3_access_key=None, s3_secret_key=None):
-        """Check if the S3 bucket exists"""
+    def check_s3_bucket(self, s3_access_key=None, s3_secret_key=None):
+        """Check if the S3 bucket exists,
+        Otherwise create the temporary bucket"""
         session = self.aws_credentials['Session']
         if s3_access_key and s3_secret_key:
             session = boto3.Session(
@@ -245,33 +248,41 @@ class AWSConvertVMDK2AMI(object):
             's3',
             config=Config(signature_version='s3v4'))
         resource = session.resource('s3')
-        bucket = None
 
-        if bucketname is not None:
+        if self.bucketname is not None:
             try:
-                response = client.head_bucket(Bucket=bucketname)
-                self.temporary = False
+                response = client.head_bucket(Bucket=self.bucketname)
+                self.temporary = response['ResponseMetadata'][
+                    'HTTPStatusCode'] == 200
             except ClientError:
-                bucketname = None
+                self.bucketname = None
 
-        if bucketname is None:
-            bucketname = 'CentOS.AMI.{}.{}'.format(
+        if self.bucketname is None:
+            self.bucketname = 'CentOS.AMI.{}.{}'.format(
                 self.filename,
                 datetime.datetime.utcnow().strftime('%Y%m%d.%H%M%S'))
             if self.source_region != 'us-east-1':
                 bucket = resource.create_bucket(
-                    Bucket=bucketname,
+                    Bucket=self.bucketname,
                     ACL='private',
                     CreateBucketConfiguration={
                         'LocationConstraint': self.source_region})
             else:
                 bucket = resource.create_bucket(
-                    Bucket=bucketname,
+                    Bucket=self.bucketname,
                     ACL='private')
+
+            if self.tags is not None:
+                client.put_bucket_tagging(
+                    Bucket=bucket.name,
+                    Tagging={
+                        'TagSet': self.tags
+                    }
+                )
 
             # Enable encryption
             client.put_bucket_encryption(
-                Bucket=bucket.name,
+                Bucket=self.bucketname,
                 ServerSideEncryptionConfiguration={
                     'Rules': [
                         {
@@ -282,12 +293,8 @@ class AWSConvertVMDK2AMI(object):
                     ]
                 }
             )
-        else:
-            bucket = resource.Bucket(name=bucketname)
 
-        return bucket
-
-    def upload_to_s3(self, bucketname=None, s3_access_key=None, s3_secret_key=None):
+    def upload_to_s3(self, s3_access_key=None, s3_secret_key=None):
         """Upload the VMDK file to S3 using s3_access_key & s3_secret_key
         credentials (if given) otherwise, default to aws_profile or
         aws_access_key/aws_secret key combination given when initialized"""
@@ -300,29 +307,25 @@ class AWSConvertVMDK2AMI(object):
         client = session.client(
             's3',
             config=Config(signature_version='s3v4'))
-        resource = session.resource('s3')
-        bucket = self.check_s3_bucket(
-            bucketname=bucketname,
+        self.check_s3_bucket(
             s3_access_key=s3_access_key,
             s3_secret_key=s3_secret_key)
 
         if self.verification:
             sha256sum = calculate_sha256_sum(self.filename)
 
-            extra_args = {'Metadata':
-                {'x-amz-content-sha256': sha256sum}
-            }
+            extra_args = {'Metadata': {'x-amz-content-sha256': sha256sum}}
 
             # Upload the file
             client.upload_file(
                 self.fullpath,
-                bucket.name,
+                self.bucketname,
                 self.filename,
                 extra_args)
 
             # Re-download the file to verify
-            s3_object = s3.Object(
-                bucket.name,
+            s3_object = client.Object(
+                self.bucketname,
                 self.filename)
             s3_object.download_file(self.fullpath + '.verify')
             test_sha256 = calculate_sha256_sum(self.fullpath + '.verify')
@@ -336,13 +339,12 @@ class AWSConvertVMDK2AMI(object):
         else:
             client.upload_file(
                 self.fullpath,
-                bucket.name,
+                self.bucketname,
                 self.filename,
                 extra_args)
 
-        return bucket.name
-
-    def export_ami(self, bucketname=None, alt_access_key=None, alt_secret_key=None):
+    def export_ami(self, alt_access_key=None, alt_secret_key=None):
+        """Exports the AMI from the uploaded S3 VMDK"""
         session = self.aws_credentials['Session']
         if alt_access_key and alt_secret_key:
             session = boto3.Session(
@@ -350,28 +352,20 @@ class AWSConvertVMDK2AMI(object):
                 aws_secret_access_key=alt_secret_key,
                 region_name=self.source_region)
 
-        if bucketname is None:
-           bucketname = self.upload_to_s3(bucketname, alt_access_key, alt_secret_key)
-
-#        version, revision = re.findall(
-#            'CentOS-(\d+)-x86_64-Vagrant-(\d+_\d+)\.VirtualBox',
-#            self.filename)[0]
-        description = 'CentOS Linux {} x86_64 HVM EBS {} {}'.format(
-                self.data['CentOS Version'],
-                self.data['Revision'],
-                datetime.datetime.utcnow().strftime('%Y-%m-%d-%H%M%S'))
+        if self.bucketname is None:
+            self.upload_to_s3(alt_access_key, alt_secret_key)
 
         ec2 = session.client('ec2', region_name=self.source_region)
         response = ec2.import_image(
             Architecture='x86_64',
-            Description=description,
+            Description=self.description,
             DiskContainers=[
                 {
-                    'Description': description,
+                    'Description': self.description,
                     'DeviceName': '/dev/sda1',
                     'Format': 'VMDK',
                     'Url': 's3://{}/{}'.format(
-                        bucketname, self.filename)
+                        self.bucketname, self.filename)
                 }
             ],
             Hypervisor='xen',
@@ -384,16 +378,41 @@ class AWSConvertVMDK2AMI(object):
         for region in self.destination_regions:
             ec2 = session.client('ec2', region_name=region)
             amis_created[region] = ec2.copy_image(
-                Description=description,
-                Name=description,
+                Description=self.description,
+                Name=self.description,
                 SourceImageId=temporary_ami,
                 SourceRegion=self.source_region)
 
         logging.info(str(
-            "Deregistering temporary AMI {}".format(temporary_ami))
+            "Deregistering temporary AMI {}".format(temporary_ami)))
         ec2 = session.client('ec2', region_name=self.source_region)
         ec2.deregister_image(ImageId=temporary_ami)
 
+        self.cleanup()
+
+    def cleanup(self, force=False):
+        """Clean up the uploaded file and temporary bucket"""
+        client = self.aws_credentials['Session'].client('s3')
+        client.delete_object(
+            Bucket=self.bucketname,
+            Key=self.filename)
+        if self.temporary:
+            if force:
+                while True:
+                    response = client.list_objects_v2(Bucket=self.bucketname)
+                    if response['KeyCount'] < 1000:
+                        client.delete_objects(
+                            Bucket=self.bucketname,
+                            Delete={
+                                'Objects':
+                                    [{'Key': item['Key']}
+                                     for item in response['Contents']]
+                            }
+                        )
+                        break
+
+            client.delete_bucket(
+                Bucket=self.bucketname)
 
 def make_opt_parser():
     """Parse the options from command line"""
