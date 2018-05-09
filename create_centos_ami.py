@@ -364,8 +364,7 @@ class AWSConvertVMDK2AMI(object):
             client.upload_file(
                 self.fullpath,
                 self.bucketname,
-                self.filename,
-                extra_args)
+                self.filename)
 
     def check_or_create_iam_role(self):
         """Checks if specified rolename exists"""
@@ -379,6 +378,25 @@ class AWSConvertVMDK2AMI(object):
 
         if self.rolename is None:
             self.rolename = 'vmimport-{}'.format(self.bucketname)
+
+            policy_doc = '{\n'
+            policy_doc += '   "Version": "2012-10-17",\n'
+            policy_doc += '   "Statement": [\n'
+            policy_doc += '      {\n'
+            policy_doc += '         "Effect": "Allow",\n'
+            policy_doc += '         "Principal": { "Service":'
+            policy_doc += ' "vmie.amazonaws.com" },\n'
+            policy_doc += '         "Action": "sts:AssumeRole",\n'
+            policy_doc += '         "Condition": {\n'
+            policy_doc += '            "StringEquals":{\n'
+            policy_doc += '               "sts:Externalid": {}\n'.format(
+                self.rolename)
+            policy_doc += '            }\n'
+            policy_doc += '         }\n'
+            policy_doc += '      }\n'
+            policy_doc += '   ]\n'
+            policy_doc += '}\n'
+
             iam.create_role(
                 RoleName=self.rolename,
                 AssumeRolePolicyDocument=json.dumps({
@@ -386,9 +404,7 @@ class AWSConvertVMDK2AMI(object):
                     "Statement": [
                         {
                             "Effect": "Allow",
-                            "Principal": {
-                                "Service": "vmie.amazonaws.com"
-                            },
+                            "Principal": { "Service": "vmie.amazonaws.com" },
                             "Action": "sts:AssumeRole",
                             "Condition": {
                                 "StringEquals": {
