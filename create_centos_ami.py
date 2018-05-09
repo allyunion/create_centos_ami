@@ -392,7 +392,7 @@ class AWSConvertVMDK2AMI(object):
                             "Action": "sts:AssumeRole",
                             "Condition": {
                                 "StringEquals": {
-                                    "sts:Externalid": "vmimport"
+                                    "sts:Externalid": self.rolename
                                 }
                             }
                         }
@@ -442,6 +442,9 @@ class AWSConvertVMDK2AMI(object):
         if (self.temporary['Rolename'] or force) \
                 and self.rolename is not None:
             iam = self.aws_credentials['Session'].client('iam')
+            iam.delete_role_policy(
+                RoleName=self.rolename,
+                PolicyName=self.rolename)
             iam.delete_role(RoleName=self.rolename)
 
     def export_ami(self, alt_access_key=None, alt_secret_key=None):
