@@ -401,6 +401,8 @@ class AWSConvertVMDK2AMI(object):
                 Description='Role for vmimport for {}'.format(
                     self.description),
             )
+            arn_aws = 'aws-cn' if re.match(
+                '^cn-', source_region) is not None else 'aws'
             iam.put_role_policy(
                 RoleName=self.rolename,
                 PolicyName=self.rolename,
@@ -415,8 +417,10 @@ class AWSConvertVMDK2AMI(object):
                                 "s3:ListBucket"
                             ],
                             "Resource": [
-                                "arn:aws:s3:::{}".format(self.bucketname),
-                                "arn:aws:s3:::{}/*".format(self.bucketname)
+                                "arn:{}:s3:::{}".format(arn_aws,
+                                    self.bucketname),
+                                "arn:{}:s3:::{}/*".format(arn_aws,
+                                    self.bucketname)
                             ]
                         },
                         {
@@ -435,7 +439,8 @@ class AWSConvertVMDK2AMI(object):
 
     def cleanup_role(self, force=False):
         """Deletes the temporary created role"""
-        if self.temporary['Rolename'] or force:
+        if (self.temporary['Rolename'] or force) \
+                and self.rolename is not None:
             iam = self.aws_credentials['Session'].client('iam')
             iam.delete_role(RoleName=self.rolename)
 
