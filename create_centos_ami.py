@@ -402,7 +402,7 @@ class AWSConvertVMDK2AMI(object):
                     self.description),
             )
             arn_aws = 'aws-cn' if re.match(
-                '^cn-', source_region) is not None else 'aws'
+                '^cn-', self.source_region) is not None else 'aws'
             iam.put_role_policy(
                 RoleName=self.rolename,
                 PolicyName=self.rolename,
@@ -418,9 +418,9 @@ class AWSConvertVMDK2AMI(object):
                             ],
                             "Resource": [
                                 "arn:{}:s3:::{}".format(arn_aws,
-                                    self.bucketname),
+                                                        self.bucketname),
                                 "arn:{}:s3:::{}/*".format(arn_aws,
-                                    self.bucketname)
+                                                          self.bucketname)
                             ]
                         },
                         {
