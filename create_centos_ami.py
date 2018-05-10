@@ -19,7 +19,7 @@ import re
 from urllib.request import HTTPError
 import subprocess
 import sys
-#import time
+import time
 
 # Custom Libraries
 
@@ -195,7 +195,6 @@ class AWSConvertVMDK2AMI(object):
         }
         self.description = description
         self.bucketname = bucket
-        self.rolename = rolename
         self.tags = tags
         self.temporary = {
             'Bucket': bucket is None,
@@ -370,98 +369,86 @@ class AWSConvertVMDK2AMI(object):
         """Checks if specified rolename exists"""
 
         iam = self.aws_credentials['Session'].client('iam')
-        if self.rolename is not None:
-            try:
-                iam.get_role(RoleName=self.rolename)
-            except iam.exceptions.NoSuchEntityException:
-                self.rolename = None
 
-        if self.rolename is None:
-            self.rolename = 'vmimport-{}'.format(self.bucketname)
+        policy_doc = '{\n'
+        policy_doc += '   "Version": "2012-10-17",\n'
+        policy_doc += '   "Statement": [\n'
+        policy_doc += '      {\n'
+        policy_doc += '         "Effect": "Allow",\n'
+        policy_doc += '         "Principal": { "Service":'
+        policy_doc += ' "vmie.amazonaws.com" },\n'
+        policy_doc += '         "Action": "sts:AssumeRole",\n'
+        policy_doc += '         "Condition": {\n'
+        policy_doc += '            "StringEquals":{\n'
+        policy_doc += '               "sts:Externalid": "vmimport"\n'
+        policy_doc += '            }\n'
+        policy_doc += '         }\n'
+        policy_doc += '      }\n'
+        policy_doc += '   ]\n'
+        policy_doc += '}\n'
 
-            policy_doc = '{\n'
-            policy_doc += '   "Version": "2012-10-17",\n'
-            policy_doc += '   "Statement": [\n'
-            policy_doc += '      {\n'
-            policy_doc += '         "Effect": "Allow",\n'
-            policy_doc += '         "Principal": { "Service":'
-            policy_doc += ' "vmie.amazonaws.com" },\n'
-            policy_doc += '         "Action": "sts:AssumeRole",\n'
-            policy_doc += '         "Condition": {\n'
-            policy_doc += '            "StringEquals":{\n'
-            policy_doc += '               "sts:Externalid": {}\n'.format(
-                self.rolename)
-            policy_doc += '            }\n'
-            policy_doc += '         }\n'
-            policy_doc += '      }\n'
-            policy_doc += '   ]\n'
-            policy_doc += '}\n'
-
+        try:
             iam.create_role(
-                RoleName=self.rolename,
-                AssumeRolePolicyDocument=json.dumps({
-                    "Version": "2012-10-17",
-                    "Statement": [
-                        {
-                            "Effect": "Allow",
-                            "Principal": { "Service": "vmie.amazonaws.com" },
-                            "Action": "sts:AssumeRole",
-                            "Condition": {
-                                "StringEquals": {
-                                    "sts:Externalid": self.rolename
-                                }
-                            }
-                        }
-                    ]
-                }),
+                RoleName='vmimport',
+                AssumeRolePolicyDocument=policy_doc,
                 Description='Role for vmimport for {}'.format(
-                    self.description),
+                    self.bucketname),
             )
-            arn_aws = 'aws-cn' if re.match(
-                '^cn-', self.source_region) is not None else 'aws'
-            iam.put_role_policy(
-                RoleName=self.rolename,
-                PolicyName=self.rolename,
-                PolicyDocument=json.dumps({
-                    "Version": "2012-10-17",
-                    "Statement": [
-                        {
-                            "Effect": "Allow",
-                            "Action": [
-                                "s3:GetBucketLocation",
-                                "s3:GetObject",
-                                "s3:ListBucket"
-                            ],
-                            "Resource": [
-                                "arn:{}:s3:::{}".format(arn_aws,
-                                                        self.bucketname),
-                                "arn:{}:s3:::{}/*".format(arn_aws,
-                                                          self.bucketname)
-                            ]
-                        },
-                        {
-                            "Effect": "Allow",
-                            "Action": [
-                                "ec2:ModifySnapshotAttribute",
-                                "ec2:CopySnapshot",
-                                "ec2:RegisterImage",
-                                "ec2:Describe*"
-                            ],
-                            "Resource": "*"
-                        }
-                    ]
-                })
-            )
+        except Exception as exception:
+            raise Exception(str('Policy Document:\n{}'.format(policy_doc))) from exception
+        
+        arn_aws = 'aws-cn' if re.match(
+            '^cn-', self.source_region) is not None else 'aws'
+
+        s3_waiter = self.aws_credentials[
+            'Session'].client('s3').get_waiter('bucket_exists')
+        s3_waiter.wait(Bucket=self.bucketname)
+
+        iam.put_role_policy(
+            RoleName='vmimport',
+            PolicyName='vmimport-{}'.format(self.bucketname),
+            PolicyDocument=json.dumps({
+                "Version": "2012-10-17",
+                "Statement": [
+                    {
+                        "Effect": "Allow",
+                        "Action": [
+                            "s3:GetBucketLocation",
+                            "s3:GetObject",
+                            "s3:ListBucket"
+                        ],
+                        "Resource": [
+                            "arn:{}:s3:::{}".format(arn_aws,
+                                                    self.bucketname),
+                            "arn:{}:s3:::{}/*".format(arn_aws,
+                                                      self.bucketname)
+                        ]
+                    },
+                    {
+                        "Effect": "Allow",
+                        "Action": [
+                            "ec2:ModifySnapshotAttribute",
+                            "ec2:CopySnapshot",
+                            "ec2:RegisterImage",
+                            "ec2:Describe*"
+                        ],
+                        "Resource": "*"
+                    }
+                ]
+            })
+        )
 
     def cleanup_role(self, force=False):
         """Deletes the temporary created role"""
-        if (self.temporary['Rolename'] or force) \
-                and self.rolename is not None:
+        if self.temporary['Rolename'] or force:
             iam = self.aws_credentials['Session'].client('iam')
-            iam.delete_role_policy(
-                RoleName=self.rolename,
-                PolicyName=self.rolename)
-            iam.delete_role(RoleName=self.rolename)
+            try:
+                iam.delete_role_policy(
+                    RoleName='vmimport',
+                    PolicyName='vmimport-{}'.format(self.bucketname))
+                iam.delete_role(RoleName='vmimport')
+            except:
+                pass
 
     def export_ami(self, alt_access_key=None, alt_secret_key=None):
         """Exports the AMI from the uploaded S3 VMDK"""
@@ -475,7 +462,13 @@ class AWSConvertVMDK2AMI(object):
         if self.bucketname is None:
             self.upload_to_s3(alt_access_key, alt_secret_key)
 
+        s3_waiter = session.client('s3').get_waiter('bucket_exists')
+        s3_waiter.wait(Bucket=self.bucketname)
+
         self.check_or_create_iam_role()
+        
+        print("Sleeping 10 seconds to allow inline policy attach to role...")
+        time.sleep(10)
 
         ec2 = session.client('ec2', region_name=self.source_region)
         response = ec2.import_image(
@@ -491,11 +484,23 @@ class AWSConvertVMDK2AMI(object):
                 }
             ],
             Hypervisor='xen',
-            LicenseType='AWS',
+            LicenseType='BYOL',
             Platform='Linux',
-            RoleName=self.rolename
+            RoleName='vmimport'
         )
-        temporary_ami = response['ImageId']
+        #temporary_ami = response['ImageId']
+        import_task_id = response['ImportTaskId']
+
+        while True:
+            response = ec2.describe_import_image_tasks(
+                ImportTaskIds=[import_task_id]))
+            progress = response['ImportImageTasks'][0]['Progress']
+            print("Current progress of import: {}%".format(progress))
+            time.sleep(15)
+            if progress == '100':
+                break
+
+        sys.exit(0)
 
         amis_created = {}
         for region in self.destination_regions:
@@ -561,10 +566,6 @@ def make_opt_parser():
                         help="Specify a bucket to use,"
                         "or one will be generated for you"
                        )
-    parser.add_argument('--rolename',
-                        default=None,
-                        help="Rolename for VM Import process"
-                       )
     parser.add_argument('--aws_access_key_id',
                         default=None,
                         help="Specify an AWS Access Key ID to use"
@@ -621,12 +622,12 @@ def main(opts):
         source_region=opts.source_region,
         destination_regions=opts.destination_regions.split(','),
         bucket=opts.bucket,
-        rolename=opts.rolename,
         tags=json.loads(opts.tags),
         verification=re.match('^cn-', opts.source_region) is not None,
         aws_access_key=opts.aws_access_key_id,
         aws_secret_key=opts.aws_secret_access_key_id,
         aws_profile=opts.aws_profile_name)
+
     try:
         awsconvert.export_ami()
     except Exception:
